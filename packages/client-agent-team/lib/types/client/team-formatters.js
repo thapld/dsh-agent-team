@@ -1,0 +1,462 @@
+import { resolveBodyMentions, scanBodyHandles } from '@contexera/dsh-agent-team/mentions';
+import { extractMarkdownPlainText } from '@deepseek-ai/dsh-client-ui-primitives';
+import { workerEngineName } from "./worker-copy.js";
+export function formatTaskStatus(status, t) {
+    return t({
+        todo: 'taskStatusTodo',
+        in_progress: 'taskStatusInProgress',
+        in_review: 'taskStatusInReview',
+        done: 'taskStatusDone',
+        closed: 'taskStatusClosed',
+    }[status]);
+}
+const RISK_CLASS_KEYS = {
+    'session-refused': ['riskClassSessionRefused', 'riskSessionRefused'],
+    'session-unreadable': ['riskClassSessionUnreadable', 'riskSessionUnreadable'],
+    'preset-composition': ['riskClassPresetComposition', 'riskPresetComposition'],
+    'rollover': ['riskClassRollover', 'riskRollover'],
+    'runtime': ['riskClassRuntime', 'riskRuntime'],
+    'activation': ['riskClassActivation', 'riskActivation'],
+    'capability-apply': ['riskClassCapabilityApply', 'riskCapabilityApply'],
+};
+/**
+ * The two localized halves of one runtime-risk statement: the class label names
+ * what kind of problem this is, and the sentence key states it of the Member
+ * (it keeps its `{member}` placeholder so the caller supplies the handle). The
+ * Host's own diagnostic stays English and belongs in the row's title, so the
+ * visible line reads in the interface language.
+ */
+export function formatRiskClass(status, t) {
+    const [labelKey, sentenceKey] = RISK_CLASS_KEYS[status.diagnostic?.class ?? 'runtime'];
+    return { label: t(labelKey), sentenceKey };
+}
+/**
+ * The first sentence of a Host diagnostic: risk rows read one line, and the
+ * Host writes the reason as its first sentence with recovery context after it.
+ * A terminator the Host used mid-sentence becomes a full stop so the clamped
+ * line reads as a sentence; the untouched text stays in the row's title.
+ */
+export function firstSentence(detail) {
+    const trimmed = detail.trim();
+    const end = trimmed.search(/[.。;；]/);
+    if (end === -1)
+        return trimmed;
+    return trimmed[end] === '.' || trimmed[end] === '。' ? trimmed.slice(0, end + 1) : `${trimmed.slice(0, end)}.`;
+}
+/**
+ * Status indicator for a Task status, the dot every Task surface renders.
+ * Active states map to StateDot variants; every status renders a dot so they
+ * share one shape language — todo is a hollow ring (not started), closed a
+ * quiet gray dot (archived).
+ */
+export function taskStatusDot(status) {
+    return { todo: 'todo', in_progress: 'ongoing', in_review: 'warning', done: 'done', closed: 'quiet' }[status];
+}
+/**
+ * How many source characters one compact line reads before parsing. The bound
+ * sits far above any display width, so only a pathological single line pays
+ * for more, and no render parses a whole long Message.
+ */
+const GIST_SOURCE_MAX_CHARACTERS = 2048;
+/** Display width of one compact body line: card titles, quote lines, Inbox rows and board titles. */
+const GIST_MAX_CHARACTERS = 120;
+/**
+ * At most `limit` code points from the front of one line. `slice` counts UTF-16
+ * units, so it can end between the halves of an astral character and leave a
+ * lone surrogate for the reader; counting characters here instead keeps the
+ * bound and the cut on the same unit. The walk stops at the limit, so a
+ * pathological line is not spread into an array in full.
+ */
+function takeCodePoints(value, limit) {
+    let end = 0;
+    let count = 0;
+    for (const character of value) {
+        if (count === limit)
+            break;
+        end += character.length;
+        count += 1;
+    }
+    return end === value.length ? value : value.slice(0, end);
+}
+/**
+ * One body line as compact plain text: the first non-empty line with its
+ * Markdown presentation projected away, whitespace compacted, then bounded.
+ * Projection runs before the bound, so a marker pair like `**…**` is never cut
+ * into an opener that never closes. A Message body keeps its Markdown wherever
+ * it renders as a Message; every label, card title, chip and quote line reads
+ * the body through here. Both bounds and the ellipsis decision count code
+ * points, so an astral character never leaves half of itself behind.
+ */
+export function plainGist(text, max = GIST_MAX_CHARACTERS) {
+    const firstLine = text.split('\n').map(line => line.trim()).find(line => line !== '') ?? '';
+    const projected = extractMarkdownPlainText(takeCodePoints(firstLine, GIST_SOURCE_MAX_CHARACTERS), { mode: 'first-line' }).replace(/\s+/g, ' ').trim();
+    return takeCodePoints(projected, max) === projected ? projected : `${takeCodePoints(projected, max - 1)}…`;
+}
+export function memberHue(memberId) {
+    let hash = 0;
+    for (let index = 0; index < memberId.length; index += 1)
+        hash = (hash * 31 + memberId.charCodeAt(index)) % 360;
+    return hash;
+}
+/**
+ * The one place an avatar initial is derived. It counts code points, not UTF-16
+ * units: `slice(0, 1)` hands a handle that opens with an astral character half a
+ * surrogate pair, which renders as a replacement mark. A caller with its own
+ * empty fallback supplies it — this answers only what the text starts with.
+ */
+export function identityInitial(text) {
+    return [...text.replace(/^@/, '').replace(/^member:/, '')][0]?.toUpperCase() ?? '';
+}
+// Full UUIDs and abbreviated forms (prefix plus the first 6+ hex chars, with
+// or without the original hyphens) both match; resolution decides whether an
+// abbreviation is real, so unresolvable matches stay plain text. Member refs
+// match the same shape; the roster map decides whether one names a member.
+const BRANDED_REF_PATTERN = /\b(task|project|channel|thread|member):{1,2}[0-9a-f]{6,}(?:-[0-9a-f]{1,})*\b/gi;
+/**
+ * Canonical form of one matched ref: models occasionally double the colon or
+ * uppercase the UUID when citing a ref in prose, while Host lookups and
+ * navigation only accept the lowercase single-colon ref the ledger mints.
+ * Bodies written before Projects were renamed cite them as `channel:`.
+ */
+function canonicalBrandedRef(match) {
+    return match.replace('::', ':').toLowerCase().replace(/^channel:/, 'project:');
+}
+/** Splits a literal run into plain and canonical branded-ref segments; prose colons never linkify. */
+export function splitBrandedRefs(text) {
+    const segments = [];
+    let cursor = 0;
+    for (const match of text.matchAll(BRANDED_REF_PATTERN)) {
+        const start = match.index ?? 0;
+        if (start > cursor)
+            segments.push({ text: text.slice(cursor, start) });
+        segments.push({ text: match[0], ref: canonicalBrandedRef(match[0]) });
+        cursor = start + match[0].length;
+    }
+    if (cursor < text.length)
+        segments.push({ text: text.slice(cursor) });
+    return segments;
+}
+/**
+ * Whether one string's whole content is exactly one branded ref. A code span
+ * like this is the model styling a ref as an identifier, not publishing code,
+ * so the Markdown pass may linkify it; anything larger stays literal.
+ */
+export function isSingleBrandedRef(text) {
+    const trimmed = text.trim();
+    if (trimmed === '')
+        return false;
+    const matches = [...trimmed.matchAll(BRANDED_REF_PATTERN)];
+    return matches.length === 1 && matches[0][0] === trimmed;
+}
+/**
+ * The Human's durable Member id. It is the ledger's own identity for the
+ * reader (`AGENT_TEAM_HUMAN_MEMBER_ID` on the Host), spelled here because a
+ * client package must not import a Host package. The same literal is already
+ * the reference for the historic handle below and for draft mention
+ * resolution, so there is one spelling in this package, not three.
+ */
+export const HUMAN_MEMBER_ID = 'member:human';
+export const HUMAN_HISTORIC_HANDLE = 'human';
+/** Every handle that addresses the Human reader, so the mention scan and chips agree on who the reader is. */
+export function humanMentionHandle(humanName) {
+    return humanName.toLowerCase() === HUMAN_HISTORIC_HANDLE ? humanName : { name: humanName, also: [HUMAN_HISTORIC_HANDLE] };
+}
+/**
+ * Whether one Message's body itself spells a handle of the reader: the same
+ * shared scan the mention chips render by, so the card's "mentioned you" says
+ * what the words say. This is deliberately not the delivery set — a Thread
+ * delivers to its Human without ever naming them, and a delivery is not a
+ * mention, so a delivery-based answer would light the card on Messages that
+ * never addressed the reader.
+ *
+ * The question is about the reader and nobody else, so the scan runs over the
+ * reader's own handles rather than over the Message's mentioned Members: naming
+ * someone else is the one thing that must never raise this. An unknown reader
+ * is named by nothing.
+ */
+export function bodyMentionsHuman(body, humanName) {
+    if (humanName === undefined)
+        return false;
+    return scanBodyHandles(body, mentionHandlesOf(humanMentionHandle(humanName)).handles).length > 0;
+}
+function mentionHandlesOf(mention) {
+    return typeof mention === 'string' ? { name: mention, handles: [mention] } : { name: mention.name, handles: [mention.name, ...mention.also] };
+}
+export function mentionNameOf(mention) {
+    return typeof mention === 'string' ? mention : mention.name;
+}
+/**
+ * Locate one Message's delivered mention names inside its literal body. Matching
+ * is the shared Host delivery scan — an authored `@`, case-insensitive on Unicode
+ * word boundaries, longest handle first, code quoted rather than called — so a chip
+ * never lands where delivery would not reach. A chip names the person by their
+ * current name, the way member refs do: a body that wrote an older handle of a
+ * renamed Human chips as the name they answer to today. A person whose entry
+ * matched through any of their handles counts as matched, so the fallback row
+ * never repeats someone already chipped inline; names absent from the body come
+ * back unmatched so the consumer can append them as a fallback chip row.
+ */
+export function splitMentionNames(text, mentions) {
+    if (mentions.length === 0)
+        return { segments: [{ text, mention: false }], unmatched: [] };
+    const entries = mentions.map(mentionHandlesOf);
+    const segments = [];
+    const matched = new Set();
+    let cursor = 0;
+    for (const match of scanBodyHandles(text, entries.flatMap(entry => entry.handles))) {
+        if (match.start > cursor)
+            segments.push({ text: text.slice(cursor, match.start), mention: false });
+        const handle = match.handle.toLowerCase();
+        const owner = entries.find(entry => entry.handles.some(candidate => candidate.toLowerCase() === handle));
+        // The scan hands back the entry's own spelling; only an entry matched
+        // through another handle prints the name it answers to today.
+        const printed = owner === undefined || owner.name.toLowerCase() === handle ? match.handle : owner.name;
+        segments.push({ text: `@${printed}`, mention: true, name: printed });
+        if (owner !== undefined)
+            matched.add(owner.name.toLowerCase());
+        cursor = match.end;
+    }
+    if (cursor < text.length)
+        segments.push({ text: text.slice(cursor), mention: false });
+    return { segments, unmatched: entries.map(entry => entry.name).filter(name => !matched.has(name.toLowerCase())) };
+}
+/** Uses the shared delivery scan so the composer agrees with the Host on what a draft mentions. */
+export function containsMention(body, handle) {
+    return scanBodyHandles(body, [handle]).length > 0;
+}
+/**
+* Member ids a draft notifies by text alone, previewing the Host's body mention resolution.
+* A written handle counts whenever its Member can still take a Message (offline included).
+* Preview-only: the body is the sole delivery authority, so this is exactly what the Host derives.
+*/
+export function mentionedMemberIds(body, members) {
+    const candidates = members
+        .filter(status => status.member.state !== 'inactive' && status.member.state !== 'archived')
+        .map(status => ({ memberId: status.member.memberId, handle: status.member.handle }));
+    // The draft's author is the Human reader, and a Message never mentions its
+    // own author: resolving with that sender drops a self-call exactly where
+    // delivery would.
+    return resolveBodyMentions(body, candidates, HUMAN_MEMBER_ID).memberIds;
+}
+/**
+* Canonical chip handles for one Message's structured mention refs. The Human is not in
+* `members()`, so the caller passes their profile name; the historic `human` alias keeps
+* pre-rename bodies chipping inline.
+*/
+export function mentionNamesOf(mentions, handles, humanName) {
+    return mentions
+        .map((memberId) => memberId === HUMAN_MEMBER_ID
+        ? humanMentionHandle(humanName)
+        : handles.get(memberId))
+        .filter((name) => name !== undefined);
+}
+/** One Member written the way every surface addresses them: `@handle`, with one prefix however the name was spelled. */
+export function memberTag(name) {
+    return `@${name.replace(/^@/, '')}`;
+}
+export function claimersLabel(owners, t) {
+    return t('claimers', { names: owners.map(owner => memberTag(owner.name)).join(', ') });
+}
+/**
+ * The faces an executor group lists: the live Claim owners other than the accountable, whose face the seat beside the
+ * group has already drawn. One person was otherwise drawn twice in one line — once as the owner, once as an executor —
+ * which read as two roles disagreeing about who holds the Task rather than as one person doing both.
+ */
+export function claimersBeyond(owners, accountable) {
+    return accountable === undefined ? owners : owners.filter(owner => owner.memberId !== accountable);
+}
+/**
+ * How a Task's responsibility is stated: the reader in the second person, a suspended owner as a standing, any other
+ * Member by handle. The card, the board and the Thread page therefore cannot describe one Task three ways.
+ */
+export function accountableLabel(owner, humanMemberId, t) {
+    if (owner.state === 'suspended')
+        return t('taskOwnerSuspended');
+    if (owner.memberId === humanMemberId)
+        return t('taskOwnerYou');
+    return t('taskOwner', { name: memberTag(owner.name) });
+}
+/**
+ * The standing as the seat writes it: the face beside it already names the person, so the words carry only the role —
+ * `负责`, the reader as `你负责`, a suspended owner as `负责 · 已暂停`. `accountableLabel` keeps the full sentence the
+ * card's accessible name and the seat's own label speak, so the concise line never becomes the only description.
+ */
+export function accountableWord(owner, humanMemberId, t) {
+    if (owner.state === 'suspended')
+        return t('taskOwnerRolePaused');
+    if (owner.memberId === humanMemberId)
+        return t('taskOwnerYou');
+    return t('taskOwnerRole');
+}
+/**
+* Mention names still worth a trailing chip: not the reader (chipped in place or unnamed),
+* and not an author the quote line already names. An unresolved quote names nobody.
+*/
+export function unshownMentionNames(names, readerName, quoteAuthor) {
+    return names.filter(name => name !== readerName && name !== quoteAuthor);
+}
+const MARKDOWN_BLOCK_CONSTRUCT = /(^|\n)[ \t]{0,3}(?:#{1,6}[ \t]|>[ \t]|[-*+][ \t]|\d+[.)][ \t])|^[ \t]*\|.+\|/m;
+const MARKDOWN_INLINE_CONSTRUCT = /[`*_[\]!]|~~~|```/;
+/**
+* Whether an Agent body survives literal rendering unchanged. Only such bodies may use inline
+* mention chips; richer Markdown cannot interleave them and keeps the trailing chip row.
+*/
+export function isPlainTextBody(text) {
+    return !(MARKDOWN_BLOCK_CONSTRUCT.test(text) || MARKDOWN_INLINE_CONSTRUCT.test(text));
+}
+const pad = (value) => String(value).padStart(2, '0');
+export function formatAbsoluteTime(occurredAt) {
+    const at = new Date(occurredAt);
+    if (Number.isNaN(at.getTime()))
+        return '';
+    return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+export function formatMessageTime(occurredAt, now = new Date()) {
+    const at = new Date(occurredAt);
+    if (Number.isNaN(at.getTime()))
+        return '';
+    const sameDay = at.getFullYear() === now.getFullYear() && at.getMonth() === now.getMonth() && at.getDate() === now.getDate();
+    if (sameDay)
+        return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+    const absolute = formatAbsoluteTime(occurredAt);
+    return at.getFullYear() === now.getFullYear() ? absolute.slice(5) : absolute;
+}
+/**
+* Clock-only label with no date: the continuation row's 28px time seat cannot fit the date
+* forms of `formatMessageTime`. The date is shown by the run's identity line and day separator.
+*/
+export function formatClockTime(occurredAt) {
+    const at = new Date(occurredAt);
+    if (Number.isNaN(at.getTime()))
+        return '';
+    return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+/** Calendar days between two instants in the viewer's zone, so "yesterday" means locally. */
+function calendarDayDelta(at, now) {
+    const midnight = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    return Math.round((midnight(now) - midnight(at)) / 86_400_000);
+}
+/**
+* Recency label for an Inbox row, shared with the Project feed entry line. Today is a bare
+* clock time; yesterday keeps its word; older entries use the Message date form.
+*/
+export function formatInboxTime(occurredAt, t, now = new Date()) {
+    const at = new Date(occurredAt);
+    if (Number.isNaN(at.getTime()))
+        return '';
+    const days = calendarDayDelta(at, now);
+    if (days === 0)
+        return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+    if (days === 1)
+        return `${t('inboxTimeYesterday')} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+    return formatMessageTime(occurredAt, now);
+}
+/**
+ * One Activity row's sentence. A Worker start carries no state of its own, so
+ * its word comes from the read's `workerStates`, never from the fact.
+ */
+export function formatActivity(activity, options) {
+    const actor = options.actorName(activity.actor);
+    if (activity.kind === 'worker_started') {
+        const engine = workerEngineName(options.t, activity.engine);
+        const run = options.workerStates?.get(activity.workerRef);
+        if (run?.unconfirmed === true)
+            return options.t('activityWorkerStartedUnconfirmed', { actor, engine });
+        if (run?.stopping === true)
+            return options.t('activityWorkerStartedStopping', { actor, engine });
+        return run?.state === 'running'
+            ? options.t('activityWorkerStartedRunning', { actor, engine })
+            : options.t('activityWorkerStarted', { actor, engine });
+    }
+    if (activity.kind === 'worker_settled') {
+        const engine = workerEngineName(options.t, activity.engine);
+        const reason = activity.reason;
+        if (activity.state === 'completed')
+            return options.t('activityWorkerSettledCompleted', { actor, engine });
+        if (activity.state === 'stopped') {
+            return reason === undefined
+                ? options.t('activityWorkerSettledStopped', { actor, engine })
+                : options.t('activityWorkerSettledStoppedWithReason', { actor, engine, reason });
+        }
+        return reason === undefined
+            ? options.t('activityWorkerSettledFailed', { actor, engine })
+            : options.t('activityWorkerSettledFailedWithReason', { actor, engine, reason });
+    }
+    if (activity.kind === 'accept') {
+        return activity.completedClaimRefs !== undefined && activity.completedClaimRefs.length > 0
+            ? options.t('activityAcceptedWithClaims', { actor, count: activity.completedClaimRefs.length })
+            : options.t('activityAccepted', { actor });
+    }
+    if (activity.kind === 'promote')
+        return options.t('activityPromoted', { actor });
+    if (activity.kind === 'transfer')
+        return options.t('activityTransferred', {
+            actor,
+            from: options.actorName(activity.from ?? activity.actor),
+            to: options.actorName(activity.to ?? activity.actor),
+        });
+    if (activity.kind === 'close')
+        return options.t('activityClosed', { actor });
+    if (activity.kind === 'reopen')
+        return options.t('activityReopened', { actor });
+    const direction = 'claimRef' in activity
+        ? options.claims.find(claim => claim.claimRef === activity.claimRef)?.direction ?? options.t('claims')
+        : options.t('claims');
+    if (activity.kind === 'claim')
+        return options.t('activityClaimed', { actor, direction });
+    if (activity.kind === 'done')
+        return options.t('activityClaimDone', { actor, direction });
+    if (activity.kind === 'release')
+        return options.t('activityClaimReleased', { actor, direction });
+    if (activity.kind === 'claims_released')
+        return options.t('activityClaimsReleased', { actor, count: activity.claimRefs.length });
+    throw new Error(`unknown Team Activity kind: ${activity.kind}`);
+}
+export function stripAttachmentLines(body) {
+    return body.replaceAll(/^\[attachment\] .*$(\n)?/gm, '').replace(/\n+$/, '');
+}
+/** Bodies past this length render clamped; derived from the body alone so every surface agrees. */
+export const MESSAGE_COLLAPSE_CHARS = 600;
+export function shouldClampMessage(displayBody) {
+    return displayBody.length > MESSAGE_COLLAPSE_CHARS;
+}
+/**
+* Decide how one Message body renders. Rich Agent Markdown keeps unmatched mentions and
+* non-Task refs in the trailing fallback row; surfaces without ref navigation render literally.
+*/
+export function planMessageBody(body, options) {
+    const stripped = stripAttachmentLines(body);
+    const displayBody = stripped === '' ? body : stripped;
+    const richAgentBody = !options.human && !isPlainTextBody(displayBody);
+    const inline = (options.human || isPlainTextBody(displayBody)) && options.mentionNames !== undefined && options.mentionNames.length > 0
+        ? splitMentionNames(displayBody, options.mentionNames)
+        : undefined;
+    const fallbackNames = inline !== undefined ? inline.unmatched
+        : richAgentBody && options.canOpenRefs && options.mentionNames !== undefined
+            // Rich Markdown with ref navigation chips mentions in place from the
+            // rendered DOM (renderResolvedMarkdownText), so the names it painted must
+            // not also be listed below: the reader would see the same @name twice.
+            ? splitMentionNames(displayBody, options.mentionNames).unmatched
+            : (options.mentionNames ?? []).map(mentionNameOf);
+    const refs = splitBrandedRefs(displayBody).flatMap(segment => segment.ref === undefined ? [] : [segment.ref]);
+    const render = inline !== undefined ? 'inline'
+        : options.human || (options.canOpenRefs && !richAgentBody && refs.length > 0) ? 'literal'
+            : 'markdown';
+    return {
+        displayBody,
+        richAgentBody,
+        render,
+        ...(inline === undefined ? {} : { inline }),
+        fallbackNames,
+        // Rich Markdown refs are painted at their authored position after the
+        // Markdown primitive has built its DOM; do not duplicate them in the
+        // trailing chip row when navigation is available.
+        fallbackRefs: richAgentBody && !options.canOpenRefs ? refs : [],
+        taskRefs: options.canOpenRefs && !richAgentBody
+            ? refs.filter(ref => ref.startsWith('task:')).map(ref => ref)
+            : [],
+        threadRefs: options.canOpenRefs && !richAgentBody
+            ? refs.filter(ref => ref.startsWith('thread:')).map(ref => ref)
+            : [],
+    };
+}

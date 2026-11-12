@@ -1,0 +1,44 @@
+/**
+ * Incremental Session-log fold with an identity guard: keeps the fold value with how far it consumed the log, so each step folds only the new tail instead of O(session length). Session-agnostic: it takes an event array plus the log offset the array starts at.
+ *
+ * Correctness rests on the append-only log (`seq` is the log index and `seq === log.length`). The guard re-folds from `logFrom` on a changed `logFrom`, a shorter log, or a different event type at the anchor, so a fork, resume, or rollover costs a cold fold, never a wrong picture.
+ *
+ * Known gap: the guard anchors on `(seq, type)`, so an event replaced in place by another of the same type at the same seq is undetected. That requires violating the append-only contract; closing it would need fingerprinting every folded event, which is the full refold this module avoids.
+ * @module @contexera/dsh-agent-team/session-event-cursor
+ */
+/** The minimum event shape the cursor reads: identity and position, never payload. */
+export interface SessionCursorEvent {
+    readonly seq: number;
+    readonly type: string;
+}
+/** One fold as the two pure functions the cursor needs. `start` is the value of an empty log; `step` returns the same reference when the event is not this fold's business. */
+export interface SessionEventFold<S, E extends SessionCursorEvent = SessionCursorEvent> {
+    readonly start: S;
+    readonly step: (state: S, event: E) => S;
+}
+/** A fold value plus its position. `foldedThrough` is a log offset (events consumed, so the next event sits at that index); `anchor` identifies the last consumed event by position and type to detect a rebuilt log. */
+export interface SessionEventCursor<S> {
+    readonly value: S;
+    readonly foldedThrough: number;
+    readonly logFrom: number;
+    readonly anchor: {
+        readonly seq: number;
+        readonly type: string;
+    } | null;
+}
+/** Opens a cursor for a log slice starting at `logFrom` (a Session's `inheritedEventCount`, or 0 for a full log); the first advance folds the whole slice. */
+export declare function initSessionEventCursor<S, E extends SessionCursorEvent>(fold: SessionEventFold<S, E>, logFrom?: number): SessionEventCursor<S>;
+/**
+ * Folds the log tail that arrived since the cursor stopped; returns the same reference when nothing is new.
+ *
+ * `events` starts at `logFrom`, and `logEnd` is the exclusive end offset in the owning log (same coordinate space as `logFrom`, not `events.length`): with 10 inherited events in a 14-event log, the slice is `events[0..4]` spanning 10 to 14, mirroring `snapshotEvents(fromSeq, toSeqExclusive)`. Both are passed explicitly so the caller states the log it folds.
+ */
+export declare function advanceSessionEventCursor<S, E extends SessionCursorEvent>(cursor: SessionEventCursor<S>, events: readonly E[], logFrom: number, logEnd: number, fold: SessionEventFold<S, E>): SessionEventCursor<S>;
+/** A cursor with the Session it folded from. Keyed by owner (a Member) so entries are bounded by the roster; the Session id stops a replacement from reading as a hit, and lives here because the cursor is Session-agnostic. */
+export interface OwnedSessionEventCursor<S> {
+    readonly sessionId: string;
+    readonly cursor: SessionEventCursor<S>;
+}
+/** Advances one owner's fold and returns the entry to store back. `events` is the Session's whole own-events slice from `logFrom`; the cursor resumes only while `owned` belongs to `sessionId`, otherwise it starts cold. */
+export declare function advanceOwnedSessionEventCursor<S, E extends SessionCursorEvent>(owned: OwnedSessionEventCursor<S> | undefined, sessionId: string, fold: SessionEventFold<S, E>, events: readonly E[], logFrom: number): OwnedSessionEventCursor<S>;
+//# sourceMappingURL=session-event-cursor.d.ts.map

@@ -1,0 +1,236 @@
+/**
+ * Registry of every model-facing recovery line the Team renders: one entry per situation, built from the values the rejection holds so the line names the refused value. It lives in the Host because both tools and the ledger reject, and tools import the Host, never the reverse. `assertRecoveryCoverage` refuses entries no situation reaches; `forbidHandWrittenRecovery` scans model-facing sources for route sentences outside the registry.
+ */
+/** One entry per model-facing fault, naming the next action and its value. Lookup is by exact kind so a new kind cannot inherit a neighbour's sentence. */
+export const RECOVERY_REGISTRY = Object.freeze([
+    {
+        kind: 'unread_required',
+        sentence: ({ threadRef, taskRef, completeFacts }) => [
+            completeFacts
+                ? 'Reconsider the pending updates above before writing; this did not mark them read. Use team_thread read if earlier context is missing. New updates, permissions and Task state are checked again.'
+                : 'Read the pending updates with team_thread read before reconsidering this write.',
+            ...(threadRef === undefined ? [] : [threadRef]),
+            ...(taskRef === undefined ? [] : [taskRef]),
+        ].join(' '),
+    },
+    {
+        kind: 'main_unread_required',
+        sentence: ({ projectRef, completeFacts }) => completeFacts
+            ? 'Reconsider the complete Main stream updates above before posting; this did not mark them read. New updates, permissions and Project state are checked again.'
+            : `Read the pending Main stream updates with team_thread read and projectRef${projectRef === undefined ? '' : ` ${projectRef}`} before reconsidering this post.`,
+    },
+    {
+        kind: 'project_owner_required',
+        sentence: ({ projectRef }) => `Only a Project owner starts or promotes a Thread, and only a Project owner or that Task's own accountable accepts one — use team_message post to speak in ${projectRef === undefined ? 'the Project' : projectRef}'s Main stream, and mention an owner when the work needs one.`,
+    },
+    {
+        kind: 'accountable_owner_required',
+        sentence: ({ taskRef }) => `Only the Task's accountable or the Human does this${taskRef === undefined ? '' : ` (${taskRef})`} — ask them in the Thread, or, when you are the accountable, use team_task transfer first.`,
+    },
+    {
+        kind: 'self_acceptance_forbidden',
+        sentence: ({ taskRef }) => `An Agent who held any Claim on${taskRef === undefined ? ' this Task' : ` ${taskRef}`} cannot accept it — if you are the accountable, use team_task transfer to give an uninvolved member responsibility for acceptance; otherwise ask the accountable or the Human in the Thread to arrange verification.`,
+    },
+    {
+        kind: 'accountable_target_invalid',
+        sentence: ({ taskRef }) => `The accountable must be an enabled Project member here or the Human${taskRef === undefined ? '' : ` (${taskRef})`} — a Task starts with a Project owner, while team_task transfer may hand it to any member who takes part; pick one from team_view and retry, and only the Human may transfer a finished Task.`,
+    },
+    {
+        kind: 'accept_requires_in_review',
+        sentence: ({ taskRef }) => `An Agent accepts only an in_review Task${taskRef === undefined ? '' : ` (${taskRef})`} — mark your Claim done with team_task done to hand it to review, or ask the Human to accept early.`,
+    },
+    {
+        kind: 'not_project_member',
+        sentence: ({ projectRef }) => `Only Project members take part in ${projectRef === undefined ? 'a Project' : projectRef} — choose a Project listed by team_view, or ask the Human or a Project owner to mention you there.`,
+    },
+    {
+        kind: 'main_stream_addressing',
+        sentence: ({ refused }) => `${refused ?? 'threadRef and projectRef'} address different things — pass threadRef to read a Thread, or projectRef to read a Project's Main stream, and retry with one of them.`,
+    },
+    {
+        kind: 'unread_remaining',
+        sentence: () => 'call team_thread read again.',
+    },
+    {
+        kind: 'stale_revision',
+        sentence: ({ threadRef, completeFacts }) => completeFacts
+            ? 'Reconsider the new facts above before using the current token; this did not mark them read. Use team_thread read if earlier context is missing. The next write is checked again.'
+            : `Read ${threadRef ?? 'the Thread'} with team_thread read to obtain the required context and current token before reconsidering this write.`,
+    },
+    {
+        // Same refusal as `stale_revision` with a different cause: the token was never a revision this Thread reached. The race sentence would send the model hunting for a nonexistent insertion. A distinct kind keeps exact-kind lookup reachable.
+        kind: 'stale_revision_token_unrecognized',
+        sentence: ({ threadRef }) => [
+            'That write token is not a revision this Thread reached; this does not establish what context you have seen.',
+            `Read ${threadRef ?? 'the Thread'} with team_thread read for context and a current token.`,
+        ].join(' '),
+    },
+    {
+        kind: 'missing_thread_identity',
+        sentence: () => 'Copy a threadRef (or a taskRef on a Taskful Thread) from team_inbox or team_view, then retry.',
+    },
+    {
+        kind: 'missing_message_ref',
+        sentence: ({ refused }) => `Copy the messageRef you were shown${refused === undefined ? '' : ` (${refused})`}, then retry.`,
+    },
+    {
+        kind: 'history_only_arguments',
+        // Only `message` reaches this now: a read ignores a page size, because its batch is bounded by design and its footer already names what remains.
+        sentence: ({ action }) => `${action ?? 'message'} reads one Message back and cannot page — drop beforeSequence and limit, or call action: history to page older facts.`,
+    },
+    {
+        kind: 'action_only_arguments',
+        // Named by parameter: `messageRef` belongs to `message` alone and would otherwise be dropped silently.
+        sentence: ({ action, parameter, owner }) => `${action ?? 'read'} does not accept ${parameter ?? 'that parameter'} — drop it, or call action: ${owner ?? 'message'} where it belongs.`,
+    },
+    {
+        kind: 'missing_write_token',
+        sentence: () => 'Copy a next-write token from a fully drained team_thread read, your own last committed mutation, or a complete Thread rejection that explicitly provides one; reconsider the facts before writing.',
+    },
+    {
+        kind: 'start_requires_project',
+        sentence: () => 'start opens a new Thread: copy a projectRef from team_view, and use reply instead when you already hold a threadRef.',
+    },
+    {
+        kind: 'post_requires_project',
+        sentence: () => 'post speaks in a Project\'s Main stream: copy a projectRef from team_view, and use reply instead when you already hold a threadRef.',
+    },
+    {
+        kind: 'dm_requires_member',
+        sentence: () => 'Copy the memberRef of an enabled Agent from team_view; a DM is a private note, so shared work belongs in a Thread reply.',
+    },
+    {
+        kind: 'claim_requires_direction',
+        sentence: () => 'claim opens a new Claim with your one-sentence direction — drop claimRef, or use done/release to change an existing one.',
+    },
+    {
+        kind: 'claim_close_requires_ref',
+        sentence: ({ action }) => `Copy the claimRef of your own Claim from team_task list or the Thread read; you can only ${action ?? 'close'} a Claim you own.`,
+    },
+    {
+        kind: 'promote_requires_thread',
+        sentence: () => 'promote needs the threadRef of the discussion Thread to turn into a Task — copy it from team_thread read or the Main stream card.',
+    },
+    {
+        kind: 'task_action_requires_task',
+        sentence: ({ action }) => `${action ?? 'This action'} needs a taskRef — copy one from team_task board or the Task's Thread read.`,
+    },
+    {
+        kind: 'list_takes_task_only',
+        sentence: () => 'Drop baseRevision, direction, claimRef, and threadRef — list takes only taskRef.',
+    },
+    {
+        kind: 'board_takes_no_task',
+        sentence: () => 'board reads the whole board — drop taskRef, threadRef, baseRevision, direction, and claimRef; to reach one Task, copy its taskRef from the board and use list.',
+    },
+    {
+        kind: 'promote_takes_thread',
+        sentence: () => 'promote works on a discussion Thread — drop taskRef, direction, and claimRef, and pass threadRef with the Thread’s current write token.',
+    },
+    {
+        kind: 'claim_owned_by_another',
+        sentence: ({ refused }) => `Claim ${refused ?? ''} belongs to another Member or another Task — list this Task's Claims with team_task list and close one of your own.`,
+    },
+    {
+        kind: 'reply_target_unknown',
+        sentence: ({ refused }) => `Reply target ${refused ?? ''} is not a recorded Message — copy a messageRef rendered by team_thread read, team_view, or an inbox notice.`,
+    },
+    {
+        kind: 'message_read_unknown',
+        sentence: ({ refused }) => `Message ${refused ?? ''} is not a recorded Message — copy a messageRef rendered by team_thread read, team_view, or an inbox notice.`,
+    },
+    {
+        kind: 'message_read_foreign',
+        sentence: ({ refused }) => `Message ${refused ?? ''} belongs to another Thread — read that Thread first, or copy a messageRef from this Thread's own read.`,
+    },
+    {
+        kind: 'message_read_foreign_project',
+        sentence: ({ refused }) => `Message ${refused ?? ''} belongs to another Project — read that Project's Main stream, or copy a messageRef from this Project's own Main stream read.`,
+    },
+    {
+        kind: 'attachment_path_rejected',
+        sentence: ({ refused }) => `Attachment ${refused ?? ''} was refused — attachments are absolute paths to one existing non-empty file within the byte limit; fix the path or drop the attachment.`,
+    },
+    {
+        kind: 'unknown_ref',
+        sentence: ({ refused }) => `${refused ?? 'That ref'} does not name anything this workspace holds — reuse the full ref exactly as returned by Team tools, or list the candidates with team_view.`,
+    },
+    {
+        kind: 'ambiguous_ref',
+        sentence: ({ refused }) => `${refused ?? 'That ref'} matches several entries — reuse a longer prefix, or the full ref exactly as returned by Team tools.`,
+    },
+    {
+        kind: 'reminder_schedule_incomplete',
+        sentence: ({ action }) => `Choose scheduleKind with that kind's own fields: 'once' with \`at\`, 'every' with \`minutes\`, or 'cron' with \`expression\`.${action === undefined ? '' : ` (${action})`}`,
+    },
+    {
+        kind: 'reminder_note_required',
+        sentence: () => 'Use the `note` parameter of team_reminder create for what this reminder is for, at most 2000 characters; it is handed back to you when the occurrence fires.',
+    },
+    {
+        kind: 'reminder_ref_required',
+        sentence: () => 'Copy a reminderRef from team_reminder list, or from the create that made it, and pass it to team_reminder cancel.',
+    },
+    {
+        kind: 'workspace_required',
+        sentence: ({ refused }) => `workspace is required when you participate in multiple Workspaces — choose one of: ${refused ?? ''}.`,
+    },
+    {
+        kind: 'workspace_ambiguous',
+        // `refused` already reads "workspace:X matches '…001', '…002'", so this
+        // sentence supplies the verdict and the route and never a second verb.
+        sentence: ({ refused }) => `${refused ?? ''} — that prefix is ambiguous: reuse a longer prefix, or the full Workspace id exactly as listed.`,
+    },
+    {
+        kind: 'workspace_not_participating',
+        sentence: ({ refused }) => `Not participating in Workspace ${refused ?? ''} — copy a full id from team_view, or a unique prefix of at least 6 hex characters.`,
+    },
+]);
+/** Every kind the registry answers, for the coverage check below. */
+export const RECOVERY_KINDS = Object.freeze(RECOVERY_REGISTRY.map(entry => entry.kind));
+/** Look one entry up by exact kind; an unregistered kind is a bug, never a silent fallback. */
+export function recoveryFor(kind) {
+    const entry = RECOVERY_REGISTRY.find(candidate => candidate.kind === kind);
+    if (entry === undefined)
+        throw new Error(`no registered recovery for '${kind}'; add an entry to RECOVERY_REGISTRY`);
+    return entry;
+}
+/** Refuses a registry entry no produced situation reaches, and a produced situation with no entry. */
+export function assertRecoveryCoverage(producedKinds) {
+    const produced = new Set(producedKinds);
+    for (const entry of RECOVERY_REGISTRY) {
+        if (!produced.has(entry.kind)) {
+            throw new Error(`recovery entry '${entry.kind}' matches no situation the Team produces`);
+        }
+    }
+    for (const kind of produced) {
+        if (!RECOVERY_KINDS.includes(kind))
+            throw new Error(`situation '${kind}' has no registered recovery`);
+    }
+}
+/** Refuses a hand-written recovery sentence in model-facing source. Comments are stripped before the scan, so only what a model would read is checked. */
+export function forbidHandWrittenRecovery(source, fileName) {
+    if (fileName.endsWith('recovery-hints.ts'))
+        return;
+    const withoutComments = stripComments(source);
+    // Imperative route shapes only: a bare `retry` also names variables and policies.
+    const routePatterns = [
+        /\b(then )?retry (this|it|the|with|again|without|after|a)\b/i,
+        /\bcopy (a|an|the) [a-zA-Z]+ (from|rendered by|you were shown)/i,
+        /\buse (action|reply|done|release)\b/i,
+        /\bcall (team_|action:)/i,
+        /\bdrop (them|it|beforeSequence|baseRevision|claimRef|direction)\b/i,
+    ];
+    for (const pattern of routePatterns) {
+        const match = pattern.exec(withoutComments);
+        if (match !== null) {
+            const line = withoutComments.slice(0, match.index).split('\n').length;
+            throw new Error(`${fileName}:${line} spells a recovery route by hand; register it in recovery-hints.ts instead`);
+        }
+    }
+}
+/** Drop comments and their contents, preserving line numbering so a hit points at real code. */
+function stripComments(source) {
+    return source.replaceAll(/\/\*[\s\S]*?\*\//gu, match => match.replaceAll(/[^\n]/gu, ' '))
+        .replaceAll(/(^|[^:])\/\/[^\n]*/gu, (match, lead) => `${lead}${' '.repeat(match.length - lead.length)}`);
+}

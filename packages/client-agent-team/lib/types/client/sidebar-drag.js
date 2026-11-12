@@ -1,0 +1,58 @@
+import { jsx as _jsx } from "react/jsx-runtime";
+/**
+ * Native whole-row drag for the Team sidebar lists. Releasing on a row commits exactly once per gesture; a release outside
+ * any row, including over the other sidebar list, cancels.
+ */
+import { useRef, useState } from 'react';
+import css from './sidebar.module.css';
+/** One drag gesture per panel instance; `onCommit` fires exactly once per completed gesture. */
+export function useSidebarRowDrag({ refs, onCommit }) {
+    const [state, setState] = useState(null);
+    const committed = useRef(false);
+    const half = (event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        return event.clientY - rect.top < rect.height / 2 ? 'before' : 'after';
+    };
+    return {
+        rowProps: orderKey => ({
+            draggable: true,
+            className: state === null ? undefined
+                : state.active === orderKey ? css.sidebarRowDragging
+                    : state.over === orderKey ? (state.marker === 'before' ? css.sidebarRowDropBefore : css.sidebarRowDropAfter)
+                        : undefined,
+            onDragStart: event => {
+                if (event.dataTransfer === null)
+                    return;
+                event.dataTransfer.effectAllowed = 'move';
+                event.dataTransfer.setData('text/plain', orderKey);
+                committed.current = false;
+                setState({ active: orderKey, over: orderKey, marker: 'after' });
+            },
+            onDragEnd: () => { setState(null); },
+            onDragOver: event => {
+                if (state === null || !refs.includes(orderKey))
+                    return;
+                event.preventDefault();
+                if (event.dataTransfer !== null)
+                    event.dataTransfer.dropEffect = 'move';
+                const marker = half(event);
+                if (state.over !== orderKey || state.marker !== marker)
+                    setState({ ...state, over: orderKey, marker });
+            },
+            onDrop: event => {
+                if (state === null || !refs.includes(orderKey))
+                    return;
+                event.preventDefault();
+                if (committed.current)
+                    return;
+                committed.current = true;
+                onCommit(state.active, orderKey, half(event));
+            },
+        }),
+    };
+}
+/** Owns the drop-marker styling for one row without adding layout; the styled row stays inside so descendant selectors keep working. */
+export function SortableRow({ drag, orderKey, children }) {
+    const props = drag.rowProps(orderKey);
+    return (_jsx("div", { ...props, children: children }));
+}
